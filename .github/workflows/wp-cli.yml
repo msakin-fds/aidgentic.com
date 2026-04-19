@@ -1,0 +1,164 @@
+name: WP-CLI on SiteGround
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'WP-CLI command to run (without the leading "wp"). Examples: core version | plugin list | user list --role=administrator | option get blogname'
+        required: true
+        default: 'core version'
+      install_wp_cli_if_missing:
+        description: 'Install WP-CLI to ~/bin on the server if not found'
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: wp-cli-siteground
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Run WP-CLI command
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SSH_HOST: ${{ vars.SITEGROUND_SSH_HOST }}
+      SSH_PORT: ${{ vars.SITEGROUND_SSH_PORT }}
+      SSH_USER: ${{ vars.SITEGROUND_SSH_USER }}
+      WP_PATH: ${{ vars.SITEGROUND_WP_PATH }}
+      SITE_URL: ${{ vars.SITEGROUND_SITE_URL }}
+
+    steps:
+      - name: Validate command (block destructive ops)
+        env:
+          CMD: ${{ inputs.command }}
+        run: |
+          set -euo pipefail
+          blocked_patterns='(^|[[:space:]])(db[[:space:]]+(drop|reset|import)|site[[:space:]]+empty|db[[:space:]]+query[[:space:]]+.*(DROP|TRUNCATE|DELETE)|plugin[[:space:]]+delete[[:space:]]+--all|theme[[:space:]]+delete[[:space:]]+--all|user[[:space:]]+delete[[:space:]]+.*--yes|core[[:space:]]+download|core[[:space:]]+install)'
+          if printf '%s' "$CMD" | grep -Eqi "$blocked_patterns"; then
+            echo "::error::Command rejected as destructive: $CMD"
+            exit 1
+          fi
+          if printf '%s' "$CMD" | grep -Eq '[;&|><`$]'; then
+            echo "::error::Command contains shell metacharacters, which are not allowed: $CMD"
+            exit 1
+          fi
+          echo "Command accepted: wp $CMD"
+
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in SSH_HOST SSH_PORT SSH_USER WP_PATH; do
+            if [ -z "${!v:-}" ]; then missing+=("$v"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing repository variables: ${missing[*]}."
+            echo "Set them under Settings -> Secrets and variables -> Actions -> Variables."
+            exit 1
+          fi
+          if [ -z "${{ secrets.SITEGROUND_SSH_KEY }}" ]; then
+            echo "::error::Missing secret: SITEGROUND_SSH_KEY"
+            exit 1
+          fi
+
+      - name: Set up SSH
+        env:
+          SSH_KEY: ${{ secrets.SITEGROUND_SSH_KEY }}
+          SSH_PASSPHRASE: ${{ secrets.SITEGROUND_SSH_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_siteground
+          chmod 600 ~/.ssh/id_siteground
+
+          eval "$(ssh-agent -s)"
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+
+          if [ -n "${SSH_PASSPHRASE:-}" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq expect >/dev/null
+            expect <<EOF
+              log_user 0
+              spawn ssh-add ~/.ssh/id_siteground
+              expect "Enter passphrase"
+              send "$SSH_PASSPHRASE\r"
+              expect eof
+EOF
+          else
+            ssh-add ~/.ssh/id_siteground
+          fi
+
+          ssh-keyscan -p "$SSH_PORT" -T 10 "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "Host siteground" > ~/.ssh/config
+          echo "  HostName $SSH_HOST" >> ~/.ssh/config
+          echo "  User $SSH_USER" >> ~/.ssh/config
+          echo "  Port $SSH_PORT" >> ~/.ssh/config
+          echo "  IdentityFile ~/.ssh/id_siteground" >> ~/.ssh/config
+          echo "  IdentitiesOnly yes" >> ~/.ssh/config
+          echo "  ServerAliveInterval 30" >> ~/.ssh/config
+          echo "  StrictHostKeyChecking accept-new" >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Verify SSH connectivity
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o ConnectTimeout=15 siteground "echo 'SSH OK'; uname -a; pwd"
+
+      - name: Ensure WP-CLI is available on the server
+        if: ${{ inputs.install_wp_cli_if_missing }}
+        run: |
+          set -euo pipefail
+          ssh siteground bash -s <<'REMOTE'
+            set -euo pipefail
+            if command -v wp >/dev/null 2>&1; then
+              echo "WP-CLI already on PATH: $(command -v wp)"
+              wp --info --skip-themes --skip-plugins 2>&1 | head -n 20
+              exit 0
+            fi
+            if [ -x "$HOME/bin/wp" ]; then
+              echo "WP-CLI already installed at $HOME/bin/wp (not on PATH)"
+              "$HOME/bin/wp" --info --skip-themes --skip-plugins 2>&1 | head -n 20
+              exit 0
+            fi
+            echo "Installing WP-CLI to ~/bin/wp ..."
+            mkdir -p "$HOME/bin"
+            curl -fsSL -o "$HOME/bin/wp.phar" https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+            chmod +x "$HOME/bin/wp.phar"
+            ln -sf "$HOME/bin/wp.phar" "$HOME/bin/wp"
+            if ! grep -q 'HOME/bin' "$HOME/.bashrc" 2>/dev/null; then
+              echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
+            fi
+            "$HOME/bin/wp" --info --skip-themes --skip-plugins 2>&1 | head -n 20
+          REMOTE
+
+      - name: Run WP-CLI command
+        env:
+          CMD: ${{ inputs.command }}
+        run: |
+          set -euo pipefail
+          ssh siteground WP_PATH="$WP_PATH" CMD="$CMD" bash -s <<'REMOTE'
+            set -euo pipefail
+            export PATH="$HOME/bin:$PATH"
+            if ! command -v wp >/dev/null 2>&1; then
+              echo "::error::wp command not found on server. Re-run with install_wp_cli_if_missing=true."
+              exit 127
+            fi
+            if [ ! -d "$WP_PATH" ]; then
+              echo "::error::WP_PATH does not exist on server: $WP_PATH"
+              exit 1
+            fi
+            cd "$WP_PATH"
+            echo "+ wp $CMD"
+            # shellcheck disable=SC2086
+            eval wp $CMD
+          REMOTE
+
+      - name: Tear down SSH agent
+        if: always()
+        run: |
+          if [ -n "${SSH_AGENT_PID:-}" ]; then kill "$SSH_AGENT_PID" 2>/dev/null || true; fi
+          rm -f ~/.ssh/id_siteground
