@@ -1,0 +1,12 @@
+@aidgentic:
+  ssh: u9-vivuzfgccwcq@ssh.aidgentic.com:18765/home/customer/www/aidgentic.com/public_html/
+  url: https://aidgentic.com
+  path: /home/customer/www/aidgentic.com/public_html/
+
+url: https://aidgentic.com
+path: public_html
+color: true
+disabled_commands:
+  - db drop
+  - db reset
+  - site empty
