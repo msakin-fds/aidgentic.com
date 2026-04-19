@@ -136,30 +136,39 @@ jobs:
           set -euo pipefail
           echo "Local: WP_PATH=$WP_PATH"
           echo "Local: CMD=$CMD"
-          REMOTE_EXPORTS="export WP_PATH=$(printf '%q' "$WP_PATH") CMD=$(printf '%q' "$CMD");"
-          ssh siteground "$REMOTE_EXPORTS bash -s" <<'REMOTE'
+
+          # Build the remote script locally (values baked in; CMD was
+          # already validated against shell metacharacters).
+          cat > /tmp/remote.sh <<REMOTE_SCRIPT
+          #!/usr/bin/env bash
           set -euo pipefail
-          export PATH="$HOME/bin:$PATH"
-          echo "Remote: WP_PATH='$WP_PATH'"
-          echo "Remote: CMD='$CMD'"
-          echo "Remote: PATH=$PATH"
-          echo "Remote: wp at $(command -v wp 2>/dev/null || echo 'NOT FOUND')"
+          export PATH="\$HOME/bin:\$PATH"
+          WP_PATH='${WP_PATH}'
+          CMD='${CMD}'
+          echo "Remote: whoami=\$(whoami)"
+          echo "Remote: host=\$(hostname)"
+          echo "Remote: WP_PATH=\$WP_PATH"
+          echo "Remote: CMD=\$CMD"
+          echo "Remote: PATH=\$PATH"
+          echo "Remote: wp at \$(command -v wp 2>/dev/null || echo 'NOT FOUND')"
           if ! command -v wp >/dev/null 2>&1; then
-            echo "::error::wp command not found on server PATH=$PATH"
+            echo "::error::wp command not found on server PATH=\$PATH"
             exit 127
           fi
-          if [ -z "$WP_PATH" ]; then
-            echo "::error::WP_PATH is empty on the remote side (env var not transferred)"
+          if [ ! -d "\$WP_PATH" ]; then
+            echo "::error::WP_PATH does not exist on server: \$WP_PATH"
             exit 1
           fi
-          if [ ! -d "$WP_PATH" ]; then
-            echo "::error::WP_PATH does not exist on server: $WP_PATH"
-            exit 1
-          fi
-          cd "$WP_PATH"
-          echo "+ wp $CMD"
-          eval wp "$CMD"
-          REMOTE
+          cd "\$WP_PATH"
+          echo "+ wp \$CMD"
+          eval wp \$CMD
+          REMOTE_SCRIPT
+
+          echo "--- remote script ---"
+          cat /tmp/remote.sh
+          echo "--- end ---"
+
+          ssh siteground 'bash -s' < /tmp/remote.sh
 
       - name: Tear down SSH agent
         if: always()
