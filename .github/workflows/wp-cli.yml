@@ -134,21 +134,31 @@ jobs:
           CMD: ${{ inputs.command }}
         run: |
           set -euo pipefail
-          ssh siteground WP_PATH="$WP_PATH" CMD="$CMD" bash -s <<'REMOTE'
-            set -euo pipefail
-            export PATH="$HOME/bin:$PATH"
-            if ! command -v wp >/dev/null 2>&1; then
-              echo "::error::wp command not found on server. Re-run with install_wp_cli_if_missing=true."
-              exit 127
-            fi
-            if [ ! -d "$WP_PATH" ]; then
-              echo "::error::WP_PATH does not exist on server: $WP_PATH"
-              exit 1
-            fi
-            cd "$WP_PATH"
-            echo "+ wp $CMD"
-            # shellcheck disable=SC2086
-            eval wp $CMD
+          echo "Local: WP_PATH=$WP_PATH"
+          echo "Local: CMD=$CMD"
+          REMOTE_EXPORTS="export WP_PATH=$(printf '%q' "$WP_PATH") CMD=$(printf '%q' "$CMD");"
+          ssh siteground "$REMOTE_EXPORTS bash -s" <<'REMOTE'
+          set -euo pipefail
+          export PATH="$HOME/bin:$PATH"
+          echo "Remote: WP_PATH='$WP_PATH'"
+          echo "Remote: CMD='$CMD'"
+          echo "Remote: PATH=$PATH"
+          echo "Remote: wp at $(command -v wp 2>/dev/null || echo 'NOT FOUND')"
+          if ! command -v wp >/dev/null 2>&1; then
+            echo "::error::wp command not found on server PATH=$PATH"
+            exit 127
+          fi
+          if [ -z "$WP_PATH" ]; then
+            echo "::error::WP_PATH is empty on the remote side (env var not transferred)"
+            exit 1
+          fi
+          if [ ! -d "$WP_PATH" ]; then
+            echo "::error::WP_PATH does not exist on server: $WP_PATH"
+            exit 1
+          fi
+          cd "$WP_PATH"
+          echo "+ wp $CMD"
+          eval wp "$CMD"
           REMOTE
 
       - name: Tear down SSH agent
